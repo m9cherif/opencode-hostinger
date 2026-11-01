@@ -19,11 +19,11 @@ const binary =
 
 const workdir = process.env.OPENCODE_WORKDIR || __dirname;
 
-// OpenCode itself listens on this internal loopback port only;
-// the public port above is served by the proxy below.
-const internalPort = port + 1;
+// OpenCode itself listens on an internal loopback port only; the public port
+// above is served by the reverse proxy below.
+let internalPort = port + 1;
 
-if (!Number.isInteger(port) || port < 1 || port > 65533) {
+if (!Number.isInteger(port) || port < 1 || port > 65000) {
   console.error("ERROR: Hostinger did not provide a valid PORT.");
   process.exit(1);
 }
@@ -47,7 +47,7 @@ try {
 // ---------------------------------------------------------------------------
 // Public proxy. listen() is called SYNCHRONOUSLY at startup because Hostinger
 // kills the app if no server is listening within 3 seconds. OpenCode boots
-// much slower than that, so until it is ready the proxy answers 502.
+// much slower than that, so until it is ready the proxy answers 503.
 // ---------------------------------------------------------------------------
 let opencodeReady = false;
 
@@ -135,18 +135,30 @@ server.on("error", (error) => {
 let child = null;
 let shuttingDown = false;
 let restarts = 0;
+let childStartedAt = 0;
+
+// Passenger/LSNODE injects NODE_OPTIONS (a --require preload script) into the
+// app environment. Strip it so it cannot leak into the spawned binary.
+function childEnv() {
+  const env = { ...process.env };
+  delete env.NODE_OPTIONS;
+  return env;
+}
 
 function startOpenCode() {
   console.log("Starting OpenCode web server...");
   console.log("OpenCode workspace:", workdir);
   console.log("OpenCode binary:", binary);
+  console.log("Internal port:", internalPort);
+
+  childStartedAt = Date.now();
 
   child = spawn(
     binary,
     ["web", "--hostname", "127.0.0.1", "--port", String(internalPort)],
     {
       cwd: workdir,
-      env: process.env,
+      env: childEnv(),
       stdio: "inherit",
     }
   );
@@ -165,10 +177,25 @@ function startOpenCode() {
       return;
     }
 
+    const uptime = Date.now() - childStartedAt;
+
+    // The child ran fine for a while before dying: give it a fresh restart budget.
+    if (uptime > 60000) {
+      restarts = 0;
+    }
+
     restarts += 1;
-    if (restarts > 20) {
+    if (restarts > 40) {
       console.error("Too many restarts, giving up.");
       return;
+    }
+
+    // A near-instant exit usually means the internal port is already taken
+    // (e.g. an orphaned child from a previous app instance). Move to the next
+    // port so the retry can succeed.
+    if (uptime < 3000 && code === 1) {
+      internalPort += 1;
+      console.log("Quick failure detected; moving internal port to", internalPort);
     }
 
     const delay = Math.min(restarts * 2000, 30000);
@@ -177,8 +204,10 @@ function startOpenCode() {
   });
 }
 
-// OpenCode is ready when its port accepts connections.
-function pollReady(attempt) {
+// Readiness check. Runs on an interval for the whole lifetime of the app so it
+// re-detects OpenCode after every restart (the previous implementation gave up
+// after 120 attempts, leaving the proxy stuck on 503 forever).
+const poller = setInterval(() => {
   if (shuttingDown || opencodeReady) {
     return;
   }
@@ -189,20 +218,17 @@ function pollReady(attempt) {
     probe.destroy();
   });
 
-  probe.on("error", () => {
-    probe.destroy();
-    if (attempt < 120) {
-      setTimeout(() => pollReady(attempt + 1), 1000);
-    }
-  });
-}
+  probe.on("error", () => probe.destroy());
+  probe.setTimeout(2000, () => probe.destroy());
+}, 2000);
 
-setTimeout(() => pollReady(0), 1000);
+poller.unref();
 
 function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log(`Received ${signal}; stopping OpenCode.`);
+  clearInterval(poller);
   if (child) {
     child.kill(signal);
   }
