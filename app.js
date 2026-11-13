@@ -1,10 +1,10 @@
 "use strict";
 
 // ---------------------------------------------------------------------------
-// OpenCode web UI behind Hostinger Node.js hosting (v13).
+// OpenCode web UI behind Hostinger Node.js hosting (v15).
 //
-// What changed in v13 and why
-// ---------------------------
+// Architecture and the way it was found
+// -------------------------------------
 // v11/v12 tried to hand the public port over to OpenCode ("handoff"). That
 // cannot work on this host: LSNODE gives each app worker its public socket
 // through an inherited fd / preload shim, and it only honours the FIRST
@@ -19,10 +19,12 @@
 // both app workers; a /tmp lock file elects the single spawner, and health
 // probes decide when the child must be replaced.
 //
-// Because the transport from this uid to a local port is unusual on this
-// host, the proxy tries several targets (127.0.0.1, 0.0.0.0, ::1, the public
-// address) and remembers the first that answers. Every attempt is logged and
-// exposed on /__probe so the choice is never a guess.
+// v14/v15: measured transport. On this host a connect from this uid to any
+// loopback address (127.0.0.1, 0.0.0.0, ::1 - even to our own child's freshly
+// bound port) is refused, while a connect to the machine's PUBLIC IPv4 does
+// reach the child. So the public IPv4 is the transport; loopback stays as a
+// fast-failing fallback. v15 also puts the /__diag, /__probe and /__childlog
+// endpoints behind the same basic-auth password as OpenCode.
 // ---------------------------------------------------------------------------
 
 const { spawn } = require("node:child_process");
@@ -561,8 +563,32 @@ function serveWait(res, note) {
   );
 }
 
+// The diagnostic endpoints reveal process lists and paths for the whole
+// account, so they require the same basic-auth password as OpenCode itself.
+const expectedAuth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
+
+function authorized(req) {
+  const given = req.headers.authorization;
+  return typeof given === "string" && given.length === expectedAuth.length && given === expectedAuth;
+}
+
+function deny(res) {
+  res.writeHead(401, {
+    "WWW-Authenticate": 'Basic realm="OpenCode", charset="UTF-8"',
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end("Authentication required.\n");
+}
+
 function proxyRequest(req, res) {
   state.req += 1;
+  if (req.url === "/__diag" || req.url === "/__probe" || req.url === "/__childlog") {
+    if (!authorized(req)) {
+      deny(res);
+      return;
+    }
+  }
   if (req.url === "/__diag") {
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
     res.end(buildDiagText("http"));
