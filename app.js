@@ -47,9 +47,10 @@ const workdir = process.env.OPENCODE_WORKDIR || __dirname;
 // LSNODE sets HOME to the domain directory on this host.
 const homeDir = (process.env.HOME || "/home/u170282392").split("/domains/")[0];
 
-const docroot = path.join(homeDir, "domains/opencode1.chrif.net/public_html");
-const diagFile = path.join(docroot, "diag.txt");
-const childLogFile = path.join(docroot, "childlog.txt");
+// Diagnostics live next to the app (the live build directory), never in the
+// public docroot, so they cannot be fetched without the password.
+const diagFile = path.join(__dirname, "diag.txt");
+const childLogFile = path.join(__dirname, "childlog.txt");
 
 // One shared child for every worker of this site.
 const childPort = Number(process.env.OPENCODE_CHILD_PORT || 4321);
