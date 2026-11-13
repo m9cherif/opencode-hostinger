@@ -3,23 +3,53 @@
 out=~/domains/opencode1.chrif.net/public_html/cmds.out
 exec > "$out" 2>&1
 echo "== $(date -Is) =="
-echo "user=$(id -un) uid=$(id -u) pwd=$(pwd) HOME=$HOME"
-for t in curl wget python3 node bash base64 ss netstat lsof; do printf '%s=' "$t"; command -v "$t" || echo missing; done
+b=~/opencode-1.19.3-test/opencode
 
-echo "== local tcp self-test 127.0.0.1:4399"
-node -e 'require("http").createServer((q,s)=>s.end("HELLO")).listen(4399,"127.0.0.1")' &
-sp=$!
+echo "== version"
+"$b" --version 2>&1 | head -3
+
+echo "== web help"
+"$b" web --help 2>&1 | head -70
+
+echo "== serve help"
+"$b" serve --help 2>&1 | head -40
+
+echo "== node candidates"
+ls /opt/alt/alt-nodejs*/root/usr/bin/node 2>/dev/null
+command -v lsnode
+ls -l /usr/local/bin/lsnode 2>/dev/null
+
+echo "== python tcp self test on 4400"
+(python3 -m http.server 4400 --bind 127.0.0.1 >/dev/null 2>&1 &)
 sleep 1
-curl -s -m 3 -o /dev/null -w "via127=%{http_code}\n" http://127.0.0.1:4399/ ; echo "rc=$?"
-curl -s -m 3 -o /dev/null -w "vialocalhost=%{http_code}\n" http://localhost:4399/ ; echo "rc=$?"
-kill $sp 2>/dev/null
+curl -s -m 3 -o /dev/null -w "py127=%{http_code}\n" http://127.0.0.1:4400/ ; echo "rc=$?"
+pkill -f "http.server 4400" 2>/dev/null
 
-echo "== child on 4179"
-curl -s -m 5 -o /dev/null -w "child4179=%{http_code}\n" http://127.0.0.1:4179/ ; echo "rc=$?"
+echo "== unix socket test"
+rm -f /tmp/t.sock
+python3 -c "
+import socket,os
+p='/tmp/t.sock'
+s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
+c,_=s.accept(); c.send(b'UNIX-OK'); c.close(); s.close()
+" &
+sleep 1
+python3 -c "
+import socket
+c=socket.socket(socket.AF_UNIX); c.connect('/tmp/t.sock')
+print('unix_recv', c.recv(16))
+" 2>&1
 
-echo "== live app.js"
-ls -l ~/domains/opencode1.chrif.net/hbuilds/current/nodejs/app.js
-grep -c "v13" ~/domains/opencode1.chrif.net/hbuilds/current/nodejs/app.js
+echo "== child 4321 via 127.0.0.1"
+curl -s -m 3 -o /dev/null -w "c127=%{http_code}\n" http://127.0.0.1:4321/ ; echo "rc=$?"
+echo "== child 4321 via public ipv4"
+curl -s -m 3 -o /dev/null -w "c4=%{http_code}\n" http://217.65.157.33:4321/ ; echo "rc=$?"
+echo "== child 4321 via hostname"
+getent hosts opencode1.chrif.net
+curl -s -m 3 -o /dev/null -w "chost=%{http_code}\n" https://opencode1.chrif.net:4321/ ; echo "rc=$?"
 
-echo "== console.log tail"
-tail -30 ~/domains/opencode1.chrif.net/hbuilds/current/nodejs/console.log
+echo "== interfaces"
+hostname -I 2>/dev/null
+ip -o addr 2>/dev/null | head -6
+
+echo "== done"
