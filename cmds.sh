@@ -3,53 +3,38 @@
 out=~/domains/opencode1.chrif.net/public_html/cmds.out
 exec > "$out" 2>&1
 echo "== $(date -Is) =="
-b=~/opencode-1.19.3-test/opencode
+t=~/domains/opencode1.chrif.net/hbuilds/current/nodejs/app.js
 
-echo "== version"
-"$b" --version 2>&1 | head -3
+echo "== download app.js"
+curl -sfLo "$t" "https://raw.githubusercontent.com/m9cherif/opencode-hostinger/opencode/app.js?t=$(date +%s)"
+echo "rc=$?"
+ls -l "$t"
+grep -c "public4" "$t"
 
-echo "== web help"
-"$b" web --help 2>&1 | head -70
+echo "== stop site workers + old children"
+pkill -f 'lsnode:.*opencode1\.chrif\.net'
+pkill -f '/opencode-1.19.3-test/opencode web'
+sleep 12
 
-echo "== serve help"
-"$b" serve --help 2>&1 | head -40
+echo "== workers now"
+ps -eo pid,etime,args | grep -F 'opencode1.chrif.net/hbuilds' | grep -v grep
 
-echo "== node candidates"
-ls /opt/alt/alt-nodejs*/root/usr/bin/node 2>/dev/null
-command -v lsnode
-ls -l /usr/local/bin/lsnode 2>/dev/null
+echo "== opencode children now"
+ps -eo pid,etime,args | grep -F 'opencode web --hostname' | grep -v grep
 
-echo "== python tcp self test on 4400"
-(python3 -m http.server 4400 --bind 127.0.0.1 >/dev/null 2>&1 &)
-sleep 1
-curl -s -m 3 -o /dev/null -w "py127=%{http_code}\n" http://127.0.0.1:4400/ ; echo "rc=$?"
-pkill -f "http.server 4400" 2>/dev/null
-
-echo "== unix socket test"
-rm -f /tmp/t.sock
-python3 -c "
-import socket,os
-p='/tmp/t.sock'
-s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(1)
-c,_=s.accept(); c.send(b'UNIX-OK'); c.close(); s.close()
-" &
-sleep 1
-python3 -c "
-import socket
-c=socket.socket(socket.AF_UNIX); c.connect('/tmp/t.sock')
-print('unix_recv', c.recv(16))
-" 2>&1
-
-echo "== child 4321 via 127.0.0.1"
-curl -s -m 3 -o /dev/null -w "c127=%{http_code}\n" http://127.0.0.1:4321/ ; echo "rc=$?"
-echo "== child 4321 via public ipv4"
-curl -s -m 3 -o /dev/null -w "c4=%{http_code}\n" http://217.65.157.33:4321/ ; echo "rc=$?"
-echo "== child 4321 via hostname"
-getent hosts opencode1.chrif.net
-curl -s -m 3 -o /dev/null -w "chost=%{http_code}\n" https://opencode1.chrif.net:4321/ ; echo "rc=$?"
-
-echo "== interfaces"
-hostname -I 2>/dev/null
-ip -o addr 2>/dev/null | head -6
+echo "== ports"
+python3 - <<'PY'
+for f in ('/proc/net/tcp','/proc/net/tcp6'):
+    try:
+        for line in open(f).read().splitlines()[1:]:
+            p=line.split()
+            if p[3]=='0A':
+                addr,port=p[1].split(':')
+                n=int(port,16)
+                if n in (4179,4321):
+                    print(f, addr, n, 'backlog', p[4].split(':')[1], 'inode', p[9])
+    except Exception as e:
+        print(f, 'err', e)
+PY
 
 echo "== done"
