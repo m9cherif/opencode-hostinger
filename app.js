@@ -55,7 +55,7 @@ const lockFile = path.join("/tmp", `opencode-child-${childPort}.lock`);
 
 const SPAWN_GATE_THREADS = 130;
 const PRESSURE_THREADS = 170;
-const PROBE_INTERVAL_MS = 10000;
+const PROBE_INTERVAL_MS = 8000;
 const PROBE_TIMEOUT_MS = 5000;
 const NO_TRANSPORT_GRACE_MS = 45000;
 const LOCK_STALE_MS = 60000;
@@ -439,15 +439,20 @@ function killLeechers() {
 // Transport probing: which local address actually reaches the child?
 // ---------------------------------------------------------------------------
 let transport = null;
-let publicIp = "";
+// The machine's public IPv4 (the only local address reachable from this uid).
+let publicIp = process.env.PUBLIC_IPV4 || "217.65.157.33";
 
+// Measured on this host: connects to any address of this machine that route
+// through the loopback interface are refused for this uid (even to our own
+// child's freshly bound port), while a connect to the machine's PUBLIC IPv4
+// address succeeds and reaches the child. So the public IPv4 is the primary
+// transport; the loopback variants stay as fast-failing fallbacks.
 function candidateTargets() {
-  const list = [
-    { name: "127.0.0.1", host: "127.0.0.1", port: childPort },
-    { name: "0.0.0.0", host: "0.0.0.0", port: childPort },
-    { name: "::1", host: "::1", port: childPort },
-  ];
-  if (publicIp) list.push({ name: `public:${publicIp}`, host: publicIp, port: childPort });
+  const list = [];
+  if (publicIp) list.push({ name: `public4:${publicIp}`, host: publicIp, port: childPort });
+  list.push({ name: "127.0.0.1", host: "127.0.0.1", port: childPort });
+  list.push({ name: "0.0.0.0", host: "0.0.0.0", port: childPort });
+  list.push({ name: "::1", host: "::1", port: childPort });
   return list;
 }
 
@@ -902,12 +907,16 @@ setTimeout(() => {
 }, 1500).unref();
 
 dns.promises
-  .lookup("opencode1.chrif.net")
-  .then((r) => {
-    publicIp = r.address || "";
-    if (publicIp) log(`Public address for probe fallback: ${publicIp}`);
+  .resolve4("opencode1.chrif.net")
+  .then((list) => {
+    if (list && list.length) {
+      publicIp = list[0];
+      log(`Public IPv4 for the child transport: ${publicIp}`);
+    }
   })
-  .catch(() => {});
+  .catch(() => {
+    if (!publicIp) log("Could not resolve the public IPv4; loopback fallbacks only.");
+  });
 
 setInterval(async () => {
   if (shuttingDown) return;
