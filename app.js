@@ -42,10 +42,30 @@ const binary =
   process.env.OPENCODE_BIN ||
   path.join("/home/u170282392", "opencode-1.19.3-test", "opencode");
 
-const workdir = process.env.OPENCODE_WORKDIR || __dirname;
-
 // LSNODE sets HOME to the domain directory on this host.
 const homeDir = (process.env.HOME || "/home/u170282392").split("/domains/")[0];
+
+// Project workspace (the directory OpenCode treats as the project).
+// Priority: the path in ~/.opencode-workspace (one line, editable without
+// touching code) > OPENCODE_WORKDIR from hPanel > ~/projects/opencode1.
+// The folder is created on demand so a fresh project needs no manual setup.
+function resolveWorkdir() {
+  let chosen = "";
+  try {
+    chosen = fs
+      .readFileSync(path.join(homeDir, ".opencode-workspace"), "utf8")
+      .split(/\r?\n/)[0]
+      .trim();
+  } catch {}
+  if (!chosen) chosen = (process.env.OPENCODE_WORKDIR || "").trim();
+  if (!chosen) chosen = path.join(homeDir, "projects", "opencode1");
+  try {
+    fs.mkdirSync(chosen, { recursive: true });
+  } catch {}
+  return chosen;
+}
+
+const workdir = resolveWorkdir();
 
 // Diagnostics live next to the app (the live build directory), never in the
 // public docroot, so they cannot be fetched without the password.
@@ -863,7 +883,7 @@ function buildDiagText(note) {
   lines.push(`pids.max=${pids.max || "?"} pids.current=${pids.current || "?"} pidsSource=${pids.source || pids.cgroupLine || "?"}`);
   lines.push(`disk=${JSON.stringify(disk)}`);
   lines.push(
-    `phase=${state.phase} publicPort=${port} childPort=${childPort} listening=${state.listening} child=${childRunning ? (child && child.pid) || "?" : "down"} banner=${bannerSeen} spawns=${state.spawnCount} threadsAtSpawn=${state.lastSpawnThreads} failures=${state.consecutiveFailures} locks=${state.lock} spawner=${isSpawner}`
+    `phase=${state.phase} publicPort=${port} childPort=${childPort} listening=${state.listening} child=${childRunning ? (child && child.pid) || "?" : "down"} banner=${bannerSeen} spawns=${state.spawnCount} threadsAtSpawn=${state.lastSpawnThreads} failures=${state.consecutiveFailures} locks=${state.lock} spawner=${isSpawner} workspace=${workdir}`
   );
   lines.push(`transport=${state.transport || "none"} since=${state.transportSince || "-"} probeFailures=${state.probeFailures}`);
   lines.push(`probes=${JSON.stringify(state.probes)}`);
@@ -904,7 +924,7 @@ server.requestTimeout = 0;
 server.once("listening", () => {
   state.listening = true;
   state.phase = "listening";
-  log(`Server listening on 0.0.0.0:${port} (worker pid=${process.pid}); proxy target port ${childPort}.`);
+  log(`Server listening on 0.0.0.0:${port} (worker pid=${process.pid}); proxy target port ${childPort}; workspace ${workdir}.`);
   writeDiag("listening");
 });
 
