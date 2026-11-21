@@ -1,19 +1,27 @@
 #!/bin/bash
-# Deploy the app.js pinned at this commit. Idempotent: restart only on change.
+# Collect crash evidence for the bash-tool SIGABRT.
 set -u
-t=~/domains/opencode1.chrif.net/hbuilds/current/nodejs/app.js
-o=/tmp/deploy.out
+d=$HOME/domains/opencode1.chrif.net
+o=$d/public_html/p4.txt
 {
   echo "== $(date -Is) =="
-  if curl -sfL "https://raw.githubusercontent.com/m9cherif/opencode-hostinger/73f1af0c915e654531323a64e868ea4eac28d27a/app.js" -o /tmp/app.new; then
-    echo "downloaded $(wc -c < /tmp/app.new) bytes"
-    if cmp -s /tmp/app.new "$t"; then
-      echo "app.js already current"
-    else
-      cp /tmp/app.new "$t" && echo "app.js installed; restarting" && pkill -f 'lsnode:.*opencode1\.chrif\.net'
-    fi
-  else
-    echo "app.js download failed"
-  fi
-  echo "== done =="
+  echo "-- tools --"
+  command -v gdb; command -v strace; command -v ltrace
+  echo "-- limits --"
+  ulimit -c
+  grep -E 'Max processes|Max open files|Max address' /proc/self/limits 2>/dev/null
+  echo "-- core_pattern --"
+  cat /proc/sys/kernel/core_pattern 2>&1
+  echo "-- dmesg --"
+  dmesg 2>&1 | tail -25
+  echo "-- tmp bun/crash --"
+  ls -la /tmp 2>/dev/null | grep -iE 'bun|crash|core' | head -20
+  echo "-- state files --"
+  find "$d/.local" -maxdepth 6 -type f 2>/dev/null | head -40
+  echo "-- newest logs --"
+  for f in $(find "$d/.local" -type f -name '*.log' 2>/dev/null | head -6); do
+    echo "### $f"
+    tail -60 "$f"
+  done
+  echo "-- done --"
 } > "$o" 2>&1
