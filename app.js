@@ -34,6 +34,25 @@ const os = require("node:os");
 const path = require("node:path");
 const dns = require("node:dns");
 
+// hPanel injects an environment snapshot at deploy time; a plain restart
+// keeps the old values. The protected .env is the source of truth on disk,
+// so load it here and let it override the stale process environment.
+try {
+  const envFile = "/home/u170282392/domains/opencode1.chrif.net/hbuilds/config/.env";
+  for (const line of fs.readFileSync(envFile, "utf8").split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$/);
+    if (!match) continue;
+    let value = match[2];
+    if (
+      (value.startsWith("'") && value.endsWith("'")) ||
+      (value.startsWith('"') && value.endsWith('"'))
+    ) {
+      value = value.slice(1, -1);
+    }
+    process.env[match[1]] = value;
+  }
+} catch {}
+
 const port = Number(process.env.PORT);
 const password = process.env.OPENCODE_SERVER_PASSWORD;
 const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
