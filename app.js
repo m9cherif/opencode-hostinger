@@ -36,6 +36,7 @@ const dns = require("node:dns");
 
 const port = Number(process.env.PORT);
 const password = process.env.OPENCODE_SERVER_PASSWORD;
+const username = process.env.OPENCODE_SERVER_USERNAME || "opencode";
 const PORT_HEX = port.toString(16).toUpperCase().padStart(4, "0");
 
 const binary =
@@ -586,7 +587,7 @@ function serveWait(res, note) {
 
 // The diagnostic endpoints reveal process lists and paths for the whole
 // account, so they require the same basic-auth password as OpenCode itself.
-const expectedAuth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64");
+const expectedAuth = "Basic " + Buffer.from(`${username}:${password}`).toString("base64");
 
 function authorized(req) {
   const given = req.headers.authorization;
