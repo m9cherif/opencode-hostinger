@@ -833,15 +833,23 @@ function spawnChild(scan) {
   });
 }
 
-const childOutRing = [];
-
 function handleChildOutput(text) {
   if (childTail.length < 8000) childTail += text;
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line) childOutRing.push(line);
+
+  // Write through synchronously: a Bun panic exits with SIGABRT immediately
+  // after printing, so a batched writer loses the one message we need.
+  const lines = text.split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length) {
+    try {
+      fs.appendFileSync(childLogFile, lines.map((l) => `[c] ${l.trim()}`).join("\n") + "\n");
+      const size = fs.statSync(childLogFile).size;
+      if (size > 120000) {
+        const keep = fs.readFileSync(childLogFile, "utf8").slice(-100000);
+        fs.writeFileSync(childLogFile, keep, "utf8");
+      }
+    } catch {}
+    for (const line of lines) log(`CHILD: ${line.trim().slice(0, 300)}`);
   }
-  if (childOutRing.length > 300) childOutRing.splice(0, childOutRing.length - 300);
 
   if (!bannerSeen && /Web interface:|Local access:/.test(text)) {
     bannerSeen = true;
@@ -852,21 +860,6 @@ function handleChildOutput(text) {
     }, 500).unref();
   }
 }
-
-setInterval(() => {
-  if (childOutRing.length === 0) return;
-  const batch = childOutRing.splice(0, childOutRing.length);
-  try {
-    let existing = "";
-    try {
-      existing = fs.readFileSync(childLogFile, "utf8");
-    } catch {}
-    existing += batch.map((l) => `[c] ${l}`).join("\n") + "\n";
-    if (existing.length > 60000) existing = existing.slice(existing.length - 50000);
-    fs.writeFileSync(childLogFile, existing, "utf8");
-  } catch {}
-  for (const line of batch) log(`CHILD: ${line.slice(0, 300)}`);
-}, 2000).unref();
 
 // ---------------------------------------------------------------------------
 // Diagnostics
