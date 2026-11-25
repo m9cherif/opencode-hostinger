@@ -101,7 +101,11 @@ const PRESSURE_THREADS = 170;
 const PROBE_INTERVAL_MS = 8000;
 const PROBE_TIMEOUT_MS = 5000;
 const NO_TRANSPORT_GRACE_MS = 45000;
-const LOCK_STALE_MS = 60000;
+// The lock holder rewrites the file every LOCK_HEARTBEAT_MS, so a live
+// spawner never looks older than a couple of heartbeats. LOCK_STALE_MS is
+// only a safety net for a holder whose event loop has stopped.
+const LOCK_STALE_MS = 90000;
+const LOCK_HEARTBEAT_MS = 15000;
 
 if (!Number.isInteger(port) || port < 1 || port > 65000) {
   console.error("ERROR: Hostinger did not provide a valid PORT.");
@@ -393,7 +397,48 @@ function readLock() {
   }
 }
 
+// The lock file doubles as a liveness signal: the holder rewrites its
+// timestamp on a heartbeat so peers can tell a live spawner from a dead one.
+// Before this, the timestamp was written once at acquisition, so after
+// LOCK_STALE_MS every other worker "broke" a perfectly healthy lock and
+// SIGKILLED the child it owned - one kill per worker per minute, which is
+// what killed in-flight shell calls and compaction.
+function writeLock() {
+  const tmp = `${lockFile}.${process.pid}`;
+  fs.writeFileSync(tmp, `${process.pid} ${Date.now()}`);
+  fs.renameSync(tmp, lockFile); // atomic: readers never see a partial file
+}
+
+function startLockHeartbeat() {
+  if (lockHeartbeat) return;
+  lockHeartbeat = setInterval(() => {
+    if (shuttingDown || !isSpawner) return;
+    try {
+      const cur = readLock();
+      if (cur && cur.pid !== process.pid) {
+        isSpawner = false;
+        state.lock = "lost";
+        log(`Spawner lock taken over by pid=${cur.pid}; standing down.`);
+        return;
+      }
+      writeLock();
+    } catch {}
+  }, LOCK_HEARTBEAT_MS);
+  lockHeartbeat.unref();
+}
+
+function stopLockHeartbeat() {
+  if (lockHeartbeat) clearInterval(lockHeartbeat);
+  lockHeartbeat = null;
+}
+
 function acquireLock() {
+  const held = tryAcquireLock();
+  if (held) startLockHeartbeat();
+  return held;
+}
+
+function tryAcquireLock() {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const fd = fs.openSync(lockFile, "wx");
@@ -429,6 +474,7 @@ function acquireLock() {
 }
 
 function releaseLock() {
+  stopLockHeartbeat();
   try {
     const cur = readLock();
     if (!cur || cur.pid === process.pid) fs.unlinkSync(lockFile);
@@ -734,6 +780,8 @@ let spawnTimer = null;
 let shuttingDown = false;
 let childTail = "";
 let isSpawner = false;
+let lockHeartbeat = null;
+let spawnInProgress = false;
 
 function childEnv() {
   const env = { ...process.env };
@@ -747,7 +795,7 @@ function scheduleSpawn(delay) {
   if (shuttingDown || spawnTimer || childRunning) return;
   spawnTimer = setTimeout(() => {
     spawnTimer = null;
-    trySpawn();
+    trySpawn().catch((error) => log(`trySpawn failed: ${error.message}`));
   }, delay);
 }
 
@@ -755,48 +803,66 @@ function childPortBusy() {
   return listenersOn(childPort.toString(16).toUpperCase().padStart(4, "0"));
 }
 
-function trySpawn() {
-  if (shuttingDown || childRunning || spawnTimer) return;
-  if (!isSpawner) {
-    // Re-check the lock: the holder may have died, leaving us the job.
-    if (!acquireLock()) {
-      scheduleSpawn(15000);
-      return;
-    }
-    isSpawner = true;
-  }
-
-  // Thread headroom gate (spawn EAGAIN / Bun SIGABRT protection).
-  let scan = readProcScan();
-  if (scan.ourTotalThreads > SPAWN_GATE_THREADS) {
-    lockdownFilebrowser();
-    killLeechers();
-    scan = readProcScan();
-    if (scan.ourTotalThreads > SPAWN_GATE_THREADS) {
-      state.gateSkips += 1;
-      if (state.gateSkips <= 20) {
-        log(`Gate: threads=${scan.ourTotalThreads} > ${SPAWN_GATE_THREADS}; waiting (skip ${state.gateSkips}).`);
-        scheduleSpawn(1500);
+async function trySpawn() {
+  // spawnInProgress covers the await below; without it a concurrent
+  // scheduleSpawn could race a second spawn onto the same port.
+  if (spawnInProgress || shuttingDown || childRunning || spawnTimer) return;
+  spawnInProgress = true;
+  try {
+    if (!isSpawner) {
+      // Re-check the lock: the holder may have died, leaving us the job.
+      if (!acquireLock()) {
+        scheduleSpawn(15000);
         return;
       }
-      log(`Gate: bypassing after ${state.gateSkips} skips (threads=${scan.ourTotalThreads}).`);
+      isSpawner = true;
     }
-  }
-  state.gateSkips = 0;
 
-  // Only the lock holder spawns, so any process still on the child port is a
-  // leftover from an older generation: remove it first.
-  for (const p of ourOpencodePids()) {
-    killPid(p.pid, "stale-opencode");
-  }
-  const busy = childPortBusy();
-  if (busy.length > 0) {
-    log(`Child port ${childPort} still held (${JSON.stringify(busy)}); retry shortly.`);
-    scheduleSpawn(2500);
-    return;
-  }
+    // Never kill a child that is answering. The child is shared by every
+    // worker of this site, so "no child of mine" does not mean "no child":
+    // killing a healthy one is what made shell calls and compaction die
+    // roughly once a minute.
+    const healthy = await probeAll("spawn-guard").catch(() => false);
+    if (healthy) {
+      state.phase = "serving-shared";
+      log("A healthy child is already serving; not spawning.");
+      return;
+    }
 
-  spawnChild(scan);
+    // Thread headroom gate (spawn EAGAIN / Bun SIGABRT protection).
+    let scan = readProcScan();
+    if (scan.ourTotalThreads > SPAWN_GATE_THREADS) {
+      lockdownFilebrowser();
+      killLeechers();
+      scan = readProcScan();
+      if (scan.ourTotalThreads > SPAWN_GATE_THREADS) {
+        state.gateSkips += 1;
+        if (state.gateSkips <= 20) {
+          log(`Gate: threads=${scan.ourTotalThreads} > ${SPAWN_GATE_THREADS}; waiting (skip ${state.gateSkips}).`);
+          scheduleSpawn(1500);
+          return;
+        }
+        log(`Gate: bypassing after ${state.gateSkips} skips (threads=${scan.ourTotalThreads}).`);
+      }
+    }
+    state.gateSkips = 0;
+
+    // We hold the lock and nothing is answering, so anything still on the
+    // child port is a leftover from an older generation: remove it first.
+    for (const p of ourOpencodePids()) {
+      killPid(p.pid, "stale-opencode");
+    }
+    const busy = childPortBusy();
+    if (busy.length > 0) {
+      log(`Child port ${childPort} still held (${JSON.stringify(busy)}); retry shortly.`);
+      scheduleSpawn(2500);
+      return;
+    }
+
+    spawnChild(scan);
+  } finally {
+    spawnInProgress = false;
+  }
 }
 
 function spawnChild(scan) {
@@ -1021,10 +1087,12 @@ function shutdown(signal) {
   shuttingDown = true;
   log(`Received ${signal}; stopping.`);
   if (spawnTimer) clearTimeout(spawnTimer);
+  stopLockHeartbeat();
   if (child && isSpawner) {
     try {
       child.kill(signal);
     } catch {}
+    releaseLock();
   }
   try {
     server.close();
