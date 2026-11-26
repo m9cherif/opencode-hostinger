@@ -33,6 +33,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const dns = require("node:dns");
+const https = require("node:https");
 
 // hPanel injects an environment snapshot at deploy time; a plain restart
 // keeps the old values. The protected .env is the source of truth on disk,
@@ -154,6 +155,7 @@ const state = {
   upgradeErr: 0,
   listening: false,
   transportSince: null,
+  keepalive: { ok: 0, err: 0, last: null, status: null },
 };
 
 function log(message) {
@@ -965,6 +967,8 @@ function buildDiagText(note) {
     `phase=${state.phase} publicPort=${port} childPort=${childPort} listening=${state.listening} child=${childRunning ? (child && child.pid) || "?" : "down"} banner=${bannerSeen} spawns=${state.spawnCount} threadsAtSpawn=${state.lastSpawnThreads} failures=${state.consecutiveFailures} locks=${state.lock} spawner=${isSpawner} workspace=${workdir}`
   );
   lines.push(`transport=${state.transport || "none"} since=${state.transportSince || "-"} probeFailures=${state.probeFailures}`);
+  const ka = state.keepalive;
+  lines.push(`keepalive=every ${KEEPALIVE_MS / 1000}s ok=${ka.ok} err=${ka.err} status=${ka.status ?? "-"} last=${ka.last || "-"}`);
   lines.push(`probes=${JSON.stringify(state.probes)}`);
   lines.push(`req=${state.req} proxyOk=${state.proxyOk} proxyErr=${state.proxyErr} upgradeOk=${state.upgradeOk} upgradeErr=${state.upgradeErr} lastProxyErr=${state.lastProxyErr || "-"}`);
   lines.push(`publicSockets=${JSON.stringify(portOwnerInfo())} childSockets=${JSON.stringify(childPortBusy())}`);
@@ -1043,6 +1047,51 @@ dns.promises
   .catch(() => {
     if (!publicIp) log("Could not resolve the public IPv4; loopback fallbacks only.");
   });
+
+// ---------------------------------------------------------------------------
+// Keepalive: Hostinger's lsnode wrapper exits after 300s with no inbound
+// request, and its killChildren() SIGTERMs this worker AND the shared OpenCode
+// child, killing any turn in flight. Ping our own public URL every 60s so a
+// request always traverses LiteSpeed -> lsnode -> this worker and resets that
+// idle timer. The request must go through the public URL; hitting the port
+// directly bypasses lsnode and does not reset it.
+// ---------------------------------------------------------------------------
+const KEEPALIVE_HOST = "opencode1.chrif.net";
+const KEEPALIVE_MS = 60000;
+
+function keepalivePing() {
+  if (shuttingDown) return;
+  const req = https.get(
+    {
+      host: KEEPALIVE_HOST,
+      port: 443,
+      path: "/__probe",
+      headers: { Authorization: expectedAuth, "Cache-Control": "no-store" },
+      timeout: 10000,
+      servername: KEEPALIVE_HOST,
+    },
+    (res) => {
+      state.keepalive.status = res.statusCode || 0;
+      res.resume();
+      if (res.statusCode === 200) {
+        state.keepalive.ok += 1;
+        state.keepalive.last = new Date().toISOString();
+      } else {
+        state.keepalive.err += 1;
+        log(`Keepalive ping HTTP ${res.statusCode}.`);
+      }
+    }
+  );
+  req.on("timeout", () => req.destroy(new Error("keepalive timeout")));
+  req.on("error", (err) => {
+    state.keepalive.err += 1;
+    state.keepalive.last = new Date().toISOString();
+    log(`Keepalive ping failed: ${err.message}.`);
+  });
+}
+
+setInterval(keepalivePing, KEEPALIVE_MS).unref();
+keepalivePing();
 
 setInterval(async () => {
   if (shuttingDown) return;
