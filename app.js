@@ -34,6 +34,7 @@ const os = require("node:os");
 const path = require("node:path");
 const dns = require("node:dns");
 const https = require("node:https");
+const net = require("node:net");
 
 // hPanel injects an environment snapshot at deploy time; a plain restart
 // keeps the old values. The protected .env is the source of truth on disk,
@@ -801,8 +802,37 @@ function scheduleSpawn(delay) {
   }, delay);
 }
 
-function childPortBusy() {
+function childPortListeners() {
   return listenersOn(childPort.toString(16).toUpperCase().padStart(4, "0"));
+}
+
+// Real LISTEN entries only. A read error (some hosts now return EPERM for
+// /proc/net/tcp*) must NOT count as "port busy": treating it that way made
+// trySpawn retry forever and the child never started, leaving the UI on
+// "Child port 4321 is not answering yet" indefinitely.
+function childPortBusy() {
+  return childPortListeners().filter((e) => !e.error);
+}
+
+// Ground truth for "is the port free?" that does not depend on /proc/net:
+// connect to it. ECONNREFUSED (or an immediate error) means nothing is
+// listening. Used as a fallback whenever /proc/net is unreadable.
+function portFree(p) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (free) => {
+      if (settled) return;
+      settled = true;
+      try {
+        s.destroy();
+      } catch {}
+      resolve(free);
+    };
+    const s = net.connect({ host: "127.0.0.1", port: p });
+    s.setTimeout(2000, () => done(true));
+    s.once("connect", () => done(false));
+    s.once("error", (err) => done(err.code === "ECONNREFUSED"));
+  });
 }
 
 async function trySpawn() {
@@ -859,6 +889,17 @@ async function trySpawn() {
       log(`Child port ${childPort} still held (${JSON.stringify(busy)}); retry shortly.`);
       scheduleSpawn(2500);
       return;
+    }
+    // /proc/net unreadable (EPERM): prove the port is free by connecting
+    // instead of guessing. Nothing listening -> ECONNREFUSED -> spawn.
+    const raw = childPortListeners();
+    if (raw.length > 0 && raw.every((e) => e.error)) {
+      const free = await portFree(childPort);
+      if (!free) {
+        log(`Child port ${childPort} still accepting connections (connect probe); retry shortly.`);
+        scheduleSpawn(2500);
+        return;
+      }
     }
 
     spawnChild(scan);
